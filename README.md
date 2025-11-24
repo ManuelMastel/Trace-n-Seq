@@ -2,6 +2,7 @@
 Repository containing the complete SMART seq two Trace n Seq analysis workflow, including raw and filtered objects, quality control scripts, reference based neuronal annotation, Seurat and SingleCellExperiment pipelines, and code to generate all figures for healthy, pancreatitis and cancer neuron datasets.
 
 Part 1: 
+
 This workflow processes SMART-seq single-cell FASTQ files into a unified gene-by-cell count matrix. Each cell is aligned independently using align_one_cell.sh, which runs STAR with appropriate settings and produces a BAM file plus per-gene read counts. The script submit_align_array.sh automates this by submitting one STAR job per cell to the HPC cluster, enabling large-scale parallel alignment. Once all alignments are finished, process_STAR_counts.R collects the ReadsPerGene.out.tab files, extracts gene counts, and merges them into a single matrix. The final output is a clean expression matrix (and an SCE object) ready for downstream single-cell analysis with Seurat, SingleCellExperiment, or Scanpy.
 
 1. align_one_cell.sh — Align a single cell with STAR
@@ -53,7 +54,8 @@ Purpose:
 Generate the count matrix required for downstream Seurat/SCE analysis.
 
 Part 2: 
-This covers the full downstream processing, QC, and biological interpretation of the SMART-seq2 dataset after alignment. The R Markdown workflow loads the STAR-generated count matrix, performs quality control, normalization, and detection of highly variable genes, and constructs a Seurat or SingleCellExperiment object. It then applies dimensionality reduction (PCA/UMAP), clustering, and annotation of neuronal subtypes using SingleR and curated gene signatures. Additional analyses include differential expression, detection of marker genes, and scoring of functional neuronal programs relevant to Trace-n-Seq. The final output is a fully annotated, biologically interpretable single-cell atlas of tissue-innervating neurons, presented both as an R Markdown notebook and an HTML report.
+
+This covers the full downstream processing, QC, and biological interpretation of the SMART-seq2 dataset after alignment. The R Markdown workflow (Trace-n-Seq SMART-seq2 R Analysis) loads the STAR-generated count matrix, performs quality control, normalization, and detection of highly variable genes, and constructs a Seurat or SingleCellExperiment object. It then applies dimensionality reduction (PCA/UMAP), clustering, and annotation of neuronal subtypes using SingleR and curated gene signatures. Additional analyses include differential expression, detection of marker genes, and scoring of functional neuronal programs relevant to Trace-n-Seq. The final output is a fully annotated, biologically interpretable single-cell atlas of tissue-innervating neurons, presented both as an R Markdown notebook and an HTML report (Trace-n-Seq SMART-seq2 R Analysis.html)
 sce.rds with gene counts + cell metadata
 
 
