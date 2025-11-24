@@ -1,0 +1,775 @@
+---
+title: "Trace-n-Seq SMART-seq2 Neuronal Analysis"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  results = "hide",   # hide printed text, keep plots
+  fig.align = "center",
+  fig.width = 6,
+  fig.height = 5
+)
+
+```
+
+# Introduction
+
+This notebook documents the analysis of SMART-seq2 data for the Trace-n-Seq protocol.
+The goal is to go from raw/aligned SMART-seq2 counts to high-confidence, annotated neuronal populations and compare disease states.
+
+## Overall workflow
+
+- Load pre-processed SMART-seq2 data from healthy pancreas, pancreatitis and PDAC samples.
+- Perform quality control (QC) and initial filtering at the cell level.
+- Normalize data, identify highly variable genes and perform dimensionality reduction and clustering.
+- Convert the Seurat object to a SingleCellExperiment (SCE) object for interoperability.
+- Annotate neuronal subtypes using a Linnarsson reference with a custom correlation-based method and with SingleR.
+- Convert the annotated object back to Seurat for flexible visualization.
+- Subset to peripheral neuron populations only (e.g. sympathetic noradrenergic and sensory neurons).
+- Annotate each neuron by disease state (healthy, pancreatitis, cancer).
+- Generate plots that can be included in the protocol (QC plots, UMAPs, marker expression).
+
+## Overall workflow (Figure 6 panels)
+
+- **Figure 6a** – QC of RNA counts, gene counts, mitochondrial percentage and initial filtering  
+- **Figure 6b** – UMAP after first QC  
+- **Figure 6c** – mt-Nd1 expression and MT-based filtering  
+- **Figure 6d** – UMAP after QC, colored by ganglion  
+- **Figure 6e** – Fraction of cells retained per sample  
+- **Figure 6f** – Peripherin (Prph) expression  
+- **Figure 6g** – Cell-type annotation using Zeisel et al. reference  
+- **Figure 6h** – Annotation confidence (correlation coefficient)  
+- **Figure 6i** – Clean peripheral neuron subset (annotated cell types)  
+- **Figure 6j** – Same subset colored by condition (healthy, pancreatitis, cancer)
+
+# Analysis
+## Preparation and pre-processing (Figure 6a)
+### Load required libraries
+
+We first load all R packages required for the analysis.
+These include Seurat and SingleCellExperiment for object handling, scran and SingleR for reference-based annotation, and ggplot2-based tools for visualization.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+library(Seurat)
+library(tidyverse)
+library(magrittr)
+library(SCpubr)
+library(Matrix)
+library(SingleCellExperiment)
+library(scran)
+library(SingleR)
+library(viridis)
+
+```
+
+
+### Optional: Example for reading per-cell CSV counts
+
+In some workflows, SMART-seq2 counts are stored as one CSV file per cell.
+The following example shows how these can be combined into a single count matrix and converted into a Seurat object.
+This is not used in the main analysis that follows, but serves as a template.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Example code only:
+
+# Directory containing per-cell CSV files from a previous pipeline
+# counts_dir <- "/path/to/SMARTseq_counts/"
+
+# List all CSV files
+# count_files <- list.files(counts_dir, pattern = "\.csv$", full.names = TRUE)
+
+# Read each CSV into a matrix
+# count_list <- lapply(count_files, function(f) {
+# df <- read.csv(f, row.names = 1, check.names = FALSE)
+# as.matrix(df)
+# })
+
+# Use file names (without extension) as cell IDs
+# names(count_list) <- basename(count_files) |> sub("\.csv$", "", x = _)
+
+# Identify genes present in all cells
+# common_genes <- Reduce(intersect, lapply(count_list, rownames))
+
+# Restrict each cell to the common gene set
+# count_list_common <- lapply(count_list, function(m) m[common_genes, , drop = FALSE])
+
+# Combine all per-cell matrices into one (genes x cells)
+# counts_mat <- do.call(cbind, count_list_common)
+# colnames(counts_mat) <- names(count_list_common)
+
+# Convert to sparse matrix and create a Seurat object
+# counts_sparse <- as(counts_mat, "dgCMatrix")
+# seu_from_csv  <- CreateSeuratObject(counts = counts_sparse)
+# seu_from_csv
+
+```
+
+
+### Load SMART-seq Seurat object and perform initial QC and filtering (Figure 6a)
+
+We now load the pre-assembled Seurat object generated from the SMART-seq2 pipeline.
+We examine three basic QC metrics:
+
+We examine three basic QC metrics:
+
+- **nFeature_RNA** – number of detected genes per cell (complexity)
+- **nCount_RNA** – total counts/reads per cell (library size)
+- **percent.mt** – percentage of reads mapping to mitochondrial genes (indicator of stressed or damaged cells)
+
+We then apply an initial filtering step based on gene and count thresholds.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Load raw SMART-seq2 Seurat object
+
+raw_SMART_seq_object <- readRDS("raw_SMART_seq_object.rds")
+
+# Visualize the distribution of detected genes per cell
+
+do_ViolinPlot(raw_SMART_seq_object, features = "nFeature_RNA") +
+coord_cartesian(ylim = c(0, 15000))
+
+# Visualize the distribution of total counts per cell
+
+do_ViolinPlot(raw_SMART_seq_object, features = "nCount_RNA") +
+coord_cartesian(ylim = c(0, 2500000))
+
+# Visualize the distribution of mitochondrial read percentage per cell
+
+do_ViolinPlot(raw_SMART_seq_object, features = "percent.mt") +
+coord_cartesian(ylim = c(0, 5))
+
+# Apply initial QC filter:
+
+# - Require sufficiently high library size (nCount_RNA)
+
+# - Require sufficient gene complexity (nFeature_RNA)
+
+filtered_SMART_seq_object <- subset(
+raw_SMART_seq_object,
+subset = nCount_RNA > 25000 & nFeature_RNA > 2000
+)
+
+```
+
+
+
+## First normalization and dimensional reduction (Figures 6b–c)
+
+This chunk:
+
+runs the first Seurat workflow, produces the UMAP of all cells after first QC (Figure 6b), and overlays mt-Nd1 expression (Figure 6c) used for MT-based filtering.
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Normalize data
+
+filtered_SMART_seq_object <- NormalizeData(filtered_SMART_seq_object)
+
+# Identify HVGs
+
+filtered_SMART_seq_object <- FindVariableFeatures(
+filtered_SMART_seq_object,
+selection.method = "vst",
+nfeatures        = 1000
+)
+
+VariableFeaturePlot(filtered_SMART_seq_object)
+
+# Scale
+
+filtered_SMART_seq_object <- ScaleData(filtered_SMART_seq_object)
+
+# PCA
+
+filtered_SMART_seq_object <- RunPCA(
+filtered_SMART_seq_object,
+features = VariableFeatures(filtered_SMART_seq_object)
+)
+
+ElbowPlot(filtered_SMART_seq_object)
+
+filtered_SMART_seq_object <- FindNeighbors(filtered_SMART_seq_object, dims = 1:10)
+filtered_SMART_seq_object <- FindClusters(filtered_SMART_seq_object, resolution = 0.2)
+
+filtered_SMART_seq_object <- RunUMAP(filtered_SMART_seq_object, dims = 1:10)
+filtered_SMART_seq_object <- RunTSNE(filtered_SMART_seq_object, dims = 1:10)
+
+# Figure 6b — UMAP of all cells after first QC
+
+DimPlot(filtered_SMART_seq_object, reduction = "umap", label = TRUE)
+
+# Figure 6c — mt-Nd1 expression to visualize mitochondrial content
+
+FeaturePlot(filtered_SMART_seq_object, reduction = "umap", features = "mt-Nd1")
+
+# Use percent.mt < 5% as described for subsequent filtering
+
+filtered_SMART_seq_object_2 <- subset(
+filtered_SMART_seq_object,
+subset = percent.mt < 5
+)
+
+
+```
+
+## Quantify QC efficiency per sample
+
+To evaluate library preparation and capture efficiency per sample (e.g. per animal or per condition), we compute, for each orig.ident (sample ID):
+
+1. The total number of cells before QC.
+2. The number of cells that pass QC.
+3. The percentage of cells retained.
+
+We plot these as a bar chart (per sample) and as a boxplot (distribution across samples) (Figure 6e)
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Count number of cells per sample before and after QC
+
+full_counts     <- table(raw_SMART_seq_object$orig.ident)
+filtered_counts <- table(filtered_SMART_seq_object_2$orig.ident)
+
+# Convert tables to data frames
+
+df_full     <- as.data.frame(full_counts)
+df_filtered <- as.data.frame(filtered_counts)
+
+colnames(df_full)     <- c("orig.ident", "total_cells")
+colnames(df_filtered) <- c("orig.ident", "filtered_cells")
+
+# Merge to obtain total and filtered cells per sample
+
+merged_df <- merge(df_full, df_filtered, by = "orig.ident")
+merged_df$percent <- merged_df$filtered_cells / merged_df$total_cells * 100
+
+# Order samples by retention percentage
+
+merged_df <- merged_df[order(merged_df$percent, decreasing = TRUE), ]
+merged_df$orig.ident <- factor(merged_df$orig.ident, levels = merged_df$orig.ident)
+
+# Barplot: retention rate per sample
+
+ggplot(merged_df, aes(x = orig.ident, y = percent)) +
+geom_col(fill = "steelblue") +
+coord_flip() +
+labs(
+x = "Sample (orig.ident)",
+y = "Cells passing QC (%)",
+title = "Fraction of SMART-seq2 cells retained after QC per sample"
+) +
+theme_minimal()
+
+# Boxplot: distribution of retention fractions across samples
+
+ggplot(merged_df, aes(x = "", y = percent)) +
+geom_boxplot(fill = "lightgray") +
+geom_jitter(width = 0.2, size = 2, alpha = 0.7) +
+labs(
+x = "",
+y = "Cells passing QC (%)",
+title = "Distribution of QC-passing fractions across samples"
+) +
+theme_minimal()
+
+
+```
+
+
+## Re-normalization, reclustering and ganglion annotation
+
+After removing high-mitochondrial cells, we repeat normalization, HVG selection, PCA, and clustering on the filtered object.
+We then annotate each cell’s ganglion of origin (CG, DRG or JNG) based on regular expression matching in the cell.ids field.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Normalize again after applying the mitochondrial filter
+
+filtered_SMART_seq_object_2 <- NormalizeData(filtered_SMART_seq_object_2)
+
+# Identify HVGs in the filtered object
+
+filtered_SMART_seq_object_2 <- FindVariableFeatures(
+filtered_SMART_seq_object_2,
+selection.method = "vst",
+nfeatures        = 1000
+)
+
+VariableFeaturePlot(filtered_SMART_seq_object_2)
+
+# Scale the data and re-run PCA
+
+filtered_SMART_seq_object_2 <- ScaleData(filtered_SMART_seq_object_2)
+filtered_SMART_seq_object_2 <- RunPCA(filtered_SMART_seq_object_2)
+
+ElbowPlot(filtered_SMART_seq_object_2)
+
+# Recompute neighbors, clusters and embeddings
+
+filtered_SMART_seq_object_2 <- FindNeighbors(filtered_SMART_seq_object_2, dims = 1:10)
+filtered_SMART_seq_object_2 <- FindClusters(filtered_SMART_seq_object_2, resolution = 0.2)
+
+filtered_SMART_seq_object_2 <- RunUMAP(filtered_SMART_seq_object_2, dims = 1:10)
+filtered_SMART_seq_object_2 <- RunTSNE(filtered_SMART_seq_object_2, dims = 1:10)
+
+DimPlot(filtered_SMART_seq_object_2, reduction = "umap", label = TRUE)
+
+# Annotate ganglion identity using the cell ID pattern
+
+filtered_SMART_seq_object_2$ganglion <- ifelse(
+grepl("CG",  filtered_SMART_seq_object_2$cell.ids), "CG",
+ifelse(
+grepl("DRG", filtered_SMART_seq_object_2$cell.ids), "DRG",
+"JNG"
+)
+)
+
+# UMAP colored by ganglion of origin
+
+DimPlot(filtered_SMART_seq_object_2, reduction = "umap", group.by = "ganglion")
+
+```
+
+
+## Cell type annotation
+### Convert Seurat object to SingleCellExperiment
+
+For interoperability with Bioconductor packages, we convert the Seurat object into a SingleCellExperiment (SCE) that explicitly stores both raw counts and log-normalized expression (logcounts).
+We ensure that the counts and logcounts assays are aligned (same genes and same cells).
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Start from the filtered Seurat object
+
+obj <- filtered_SMART_seq_object_2
+DefaultAssay(obj) <- "RNA"
+
+# Join layers for Seurat v5 compatibility
+
+obj <- JoinLayers(obj, assay = "RNA")
+
+# Convert Seurat object to a preliminary SCE
+
+sce_tmp <- as.SingleCellExperiment(obj)
+
+# Extract log-normalized expression and raw counts
+
+logcounts_matrix <- as.matrix(assay(sce_tmp, "logcounts"))
+counts_matrix    <- as.matrix(GetAssayData(obj, assay = "RNA", slot = "counts"))
+
+# Ensure both assays have the same genes and cells (intersection)
+
+common_genes <- intersect(rownames(logcounts_matrix), rownames(counts_matrix))
+common_cells <- intersect(colnames(logcounts_matrix), colnames(counts_matrix))
+
+logcounts_matrix <- logcounts_matrix[common_genes, common_cells, drop = FALSE]
+counts_matrix    <- counts_matrix[common_genes, common_cells, drop = FALSE]
+
+# Extract cell- and gene-level metadata
+
+cell_metadata <- colData(sce_tmp)[common_cells, , drop = FALSE]
+gene_metadata <- data.frame(gene = common_genes, row.names = common_genes)
+
+# Construct final SCE object for downstream annotation
+
+data_smartseq <- SingleCellExperiment(
+assays  = list(counts = counts_matrix, logcounts = logcounts_matrix),
+colData = cell_metadata,
+rowData = gene_metadata
+)
+
+assayNames(data_smartseq)
+dim(data_smartseq)
+
+```
+
+
+### Correlation-based Linnarsson annotation
+
+We annotate each cell by correlating its expression profile to a Linnarsson-derived reference atlas:
+
+1. Select highly variable genes (HVGs) in the query SCE.
+2. Intersect with genes present in the reference.
+3. Compute Spearman correlations between each query cell and each reference profile.
+4. Assign each cell to the reference label with the highest correlation; store the correlation value as a measure of confidence.
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+
+# Load broad and subset Linnarsson reference matrices
+
+linn_data     <- readRDS("linnarson_reference.rds")
+linn_data_sub <- readRDS("linnarson_reference_sub.rds")
+
+# Simplify column names by removing trailing numeric suffixes
+
+colnames(linn_data) <- sub("\\.[0-9]+$", "", colnames(linn_data))
+
+# 1) Make sure ref is a matrix (SingleR supports matrix or SE)
+linn_mat <- as.matrix(linn_data)
+
+# 2) Restrict to common genes
+common_genes <- intersect(rownames(data_smartseq), rownames(linn_mat))
+
+# 3) Define reference labels: one per column of linn_mat
+#    (adjust if you have a better label vector)
+ref_labels <- colnames(linn_mat)
+
+# 4) Run SingleR WITHOUT 'genes' argument
+pred <- SingleR(
+    test   = data_smartseq[common_genes, ],
+    ref    = linn_mat[common_genes, , drop = FALSE],
+    labels = ref_labels
+)
+
+
+# by default, this clusters cells and shows all label scores
+plotScoreHeatmap(pred, show.pruned = TRUE)
+
+
+# add labels and confidence to your SCE
+data_smartseq$SingleR_label      <- pred$labels
+data_smartseq$SingleR_pruned     <- pred$pruned.labels
+
+scores <- as.matrix(pred$scores)  # cells x reference labels
+head(dim(scores))
+colnames(scores)  # same labels as in the heatmap
+
+lab_idx <- match(pred$labels, colnames(scores))  # column index of chosen label per cell
+assigned_score <- scores[cbind(seq_len(nrow(scores)), lab_idx)]
+
+data_smartseq$SingleR_assigned_score <- assigned_score
+
+
+```
+
+### Convert annotated SCE back to Seurat
+
+We now convert the annotated SingleCellExperiment back into a Seurat object.
+This allows us to use Seurat’s visualization functions while preserving the annotation metadata.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# data_smartseq is your SCE object
+# It should already have assays "counts" and "logcounts"
+
+# Extract raw counts and metadata
+counts_mat    <- as.matrix(assay(data_smartseq, "counts"))
+cell_metadata <- as.data.frame(colData(data_smartseq))
+
+# Create Seurat object from raw counts
+seurat_obj <- CreateSeuratObject(
+  counts    = counts_mat,
+  meta.data = cell_metadata
+)
+
+# Run a standard Seurat workflow for visualization
+
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+seurat_obj <- RunPCA(seurat_obj)
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:10)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.2)
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:10)
+
+# UMAP embedding colored by clusters
+
+DimPlot(seurat_obj, label = TRUE, group.by = "SingleR_label") + NoLegend()
+FeaturePlot(seurat_obj, "SingleR_assigned_score")
+FeaturePlot(seurat_obj, "Prph")
+
+thr <- 0.6
+
+seurat_filtered <- subset(
+  seurat_obj,
+  subset = SingleR_assigned_score >= thr
+)
+
+DimPlot(seurat_filtered, label = TRUE)
+DimPlot(seurat_filtered, group.by = "SingleR_label")
+
+
+
+```
+
+
+## Final filtering for cell types and plotting
+### Subset to peripheral neuron populations
+
+We now focus on specific peripheral neuron populations defined in the Linnarsson atlas:
+
+1. Sympathetic noradrenergic neurons
+2. Peripheral sensory non-peptidergic neurons
+3. Peripheral sensory peptidergic neurons
+4. Peripheral sensory neurofilament neurons
+
+We subset the Seurat object to retain only cells assigned to these categories, then re-run standard normalization, HVG identification and embedding.
+
+Figure 6 d,f,g,h
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Define the set of peripheral neuron types of interest
+
+correct_cell_types <- c(
+"Sympathetic noradrenergic neurons",
+"Peripheral sensory non-peptidergic neurons",
+"Peripheral sensory peptidergic neurons",
+"Peripheral sensory neurofilament neurons"
+)
+
+# Subset Seurat object to retain only these neuronal populations
+
+filtered_anno_atlas_cell_types <- subset(
+seurat_filtered,
+subset = SingleR_label %in% correct_cell_types
+)
+
+DimPlot(filtered_anno_atlas_cell_types, label = TRUE, group.by = "SingleR_label") + NoLegend()
+
+
+
+filtered_anno_atlas_cell_types <- NormalizeData(filtered_anno_atlas_cell_types)
+filtered_anno_atlas_cell_types <- FindVariableFeatures(filtered_anno_atlas_cell_types)
+filtered_anno_atlas_cell_types <- ScaleData(filtered_anno_atlas_cell_types)
+filtered_anno_atlas_cell_types <- RunPCA(filtered_anno_atlas_cell_types)
+filtered_anno_atlas_cell_types <- FindNeighbors(filtered_anno_atlas_cell_types, dims = 1:10)
+filtered_anno_atlas_cell_types <- FindClusters(filtered_anno_atlas_cell_types)
+filtered_anno_atlas_cell_types <- RunUMAP(filtered_anno_atlas_cell_types, dims = 1:10)
+
+
+# Visualize clustering and annotations in the peripheral neuron subset
+
+DimPlot(filtered_anno_atlas_cell_types, label = TRUE)
+DimPlot(filtered_anno_atlas_cell_types, group.by = "SingleR_label")
+
+# Visualize expression of a canonical neuron marker, e.g. Prph
+
+FeaturePlot(filtered_anno_atlas_cell_types, "Prph")
+FeaturePlot(filtered_anno_atlas_cell_types, "SingleR_assigned_score")
+
+
+
+```
+
+
+### Validate annotation with marker genes
+
+Marker genes were derived from various sources: Zeisel, Sharma, Usoskin.
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+## ================================
+## DRG neuron signatures + scoring
+## ================================
+
+# 0) Your Seurat object with (peripheral) neurons
+#    assume it's called `seu`
+#    DefaultAssay(seu) <- "RNA"
+
+## 1) Proprioceptive / touch-sensation neurons
+proprioceptive_genes <- c(
+  # classic proprio/LTMR markers
+  "Nefh", "Pvalb", "Ntrk3", "Ret", "Necab2",
+  "Fam19a1", "Runx3", "Calb1", "Cacna1h",
+  # optional class labels if present
+  "Abeta-RA-LTMR", "Abeta-Field", "Adelta-LTMR", "Proprioceptors"
+)
+
+## 2) Non-peptidergic nociceptors (NP)
+non_peptidergic_genes <- c(
+  # NP core markers
+  "Mrgprd", "Prkcq", "Agtr1a", "Gfra1", "Lpar3", "Cyp26b1",
+  # C-LTMR related
+  "Th", "Vglut3", "Piezo2", "Zfp521",
+  # CGRP-theta / NP5-6 markers
+  "Calca", "MgrprA3", "Mlc1",
+  # more NP cluster markers
+  "Barx2", "Nppb", "Osmr", "Il31ra"
+)
+
+## 3) Peptidergic nociceptors (PEP)
+peptidergic_genes <- c(
+  # core PEP markers
+  "Calca", "Tac1", "Ntrk1",
+  # CGRP subtype markers
+  "Calcb",
+  "Sstr2", "Dcn", "Dcdc2a",       # alpha/beta
+  "Sertm1", "Mrap2", "Slc5a7",    # gamma
+  "Ltk", "Traf3fp3",              # epsilon
+  "Smr2", "Creg2",                # zeta
+  # TRPM8+ cooling / Pep7-8
+  "Trpm8", "Angpt4", "Ntm", "Pnoc", "Penk"
+)
+
+## Optional: keep only genes present in your object
+proprioceptive_genes   <- intersect(proprioceptive_genes,   rownames(filtered_anno_atlas_cell_types))
+non_peptidergic_genes  <- intersect(non_peptidergic_genes,  rownames(filtered_anno_atlas_cell_types))
+peptidergic_genes      <- intersect(peptidergic_genes,      rownames(filtered_anno_atlas_cell_types))
+
+## 4) Score the three major classes with AddModuleScore
+library(Seurat)
+
+filtered_anno_atlas_cell_types <- AddModuleScore(
+  filtered_anno_atlas_cell_types,
+  features = list(
+    Proprio = proprioceptive_genes,
+    NP      = non_peptidergic_genes,
+    PEP     = peptidergic_genes
+  ),
+  name = "DRG_"
+)
+# This will add metadata columns: DRG_1, DRG_2, DRG_3
+
+## 5) Visualise on UMAP
+FeaturePlot(filtered_anno_atlas_cell_types, "DRG_1")  # proprioceptive/touch
+FeaturePlot(filtered_anno_atlas_cell_types, "DRG_2")  # non-peptidergic nociceptors
+FeaturePlot(filtered_anno_atlas_cell_types, "DRG_3")  # peptidergic nociceptors
+
+## 5) Visualise on UMAP
+do_NebulosaPlot(filtered_anno_atlas_cell_types, "DRG_1")  # proprioceptive/touch
+do_NebulosaPlot(filtered_anno_atlas_cell_types, "DRG_2")  # non-peptidergic nociceptors
+do_NebulosaPlot(filtered_anno_atlas_cell_types, "DRG_3")  # peptidergic nociceptors
+
+
+# Make violin plots for comparison
+
+# 1) Define your four neuron classes (ensure factor order)
+correct_cell_types <- c(
+    "Sympathetic noradrenergic neurons",
+    "Peripheral sensory non-peptidergic neurons",
+    "Peripheral sensory peptidergic neurons",
+    "Peripheral sensory neurofilament neurons"
+)
+
+# Relevel SingleR_label so only these 4 remain and ordered nicely
+filtered_anno_atlas_cell_types$SingleR_label <- factor(
+    filtered_anno_atlas_cell_types$SingleR_label,
+    levels = correct_cell_types
+)
+
+# 2) Assign 4 colors for these 4 neuron groups
+# take any 4 nice ones from your palette or choose explicitly
+neuron_colors <- c(
+    "#CE7B63",  # Sympathetic noradrenergic
+    "#5FA898",  # Peripheral NP
+    "#D8C172",  # Peripheral PEP
+    "#7A6FB2"   # Peripheral neurofilament
+)
+names(neuron_colors) <- correct_cell_types
+
+
+# 3) Helper function to generate violin plots
+make_drg_violin <- function(seu, score_name, palette, title_text) {
+    
+    p <- VlnPlot(
+        seu,
+        features = score_name,
+        group.by = "SingleR_label",
+        pt.size = 0,
+        cols = palette
+    ) +
+        theme_classic(base_size = 10) +
+        theme(
+            legend.position = "none",
+            axis.text.x = element_text(
+                angle = 90, hjust = 1, vjust = 0.5, size = 10
+            ),
+            axis.title.x = element_blank(),
+            axis.title.y = element_text(size = 10),
+            plot.title = element_text(size = 10, face = "bold")
+        ) +
+        ylab(paste0(score_name, " score")) +
+        ggtitle(title_text)
+    
+    return(p)
+}
+
+# 4) Generate all 3 violin plots with the SAME neuron color mapping
+p_drg1 <- make_drg_violin(
+    filtered_anno_atlas_cell_types,
+    "DRG_1",
+    neuron_colors,
+    "Proprioceptive / Touch-sensation (DRG_1)"
+)
+
+p_drg2 <- make_drg_violin(
+    filtered_anno_atlas_cell_types,
+    "DRG_2",
+    neuron_colors,
+    "Non-peptidergic nociceptors (DRG_2)"
+)
+
+p_drg3 <- make_drg_violin(
+    filtered_anno_atlas_cell_types,
+    "DRG_3",
+    neuron_colors,
+    "Peptidergic nociceptors (DRG_3)"
+)
+
+# 5) Display all three plots side-by-side (patchwork)
+p_drg1 | p_drg2 | p_drg3
+
+
+```
+
+
+
+
+### Annotate disease state for each neuron
+
+Using a sample-level or cell ID–based field (clean_id), we assign each neuron to one of three disease states:
+Healthy, Pancreatitis, Cancer
+
+We then visualize the distribution of these disease states in the peripheral neuron UMAP.
+
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+
+# Annotate disease state from 'clean_id' (adapt to your naming conventions)
+
+filtered_anno_atlas_cell_types$state <- ifelse(
+grepl("pancreatitis", filtered_anno_atlas_cell_types$cell_ids, ignore.case = TRUE), "Pancreatitis",
+ifelse(
+grepl("Cancer", filtered_anno_atlas_cell_types$cell_ids, ignore.case = TRUE), "Cancer",
+"Healthy"
+)
+)
+
+# UMAP colored by disease state
+
+DimPlot(filtered_anno_atlas_cell_types, group.by = "state")
+
+```
+
+# Discussion
+
+In this analysis we present a complete and reproducible workflow for processing SMART seq two data generated with the Trace n Seq protocol, starting from raw counts and ending with high confidence neuronal annotations. The quality control strategy, which relies on library complexity, total counts and mitochondrial read percentage, successfully removed low quality cells and ensured that only biologically meaningful neuronal profiles were kept. By switching between Seurat and SingleCellExperiment formats, we were able to use the strengths of both environments, including flexible visualization and clustering in Seurat and reliable reference based annotation in the bioconductor ecosystem.
+
+A central element of the workflow is the correlation based annotation using the Linnarsson reference atlas. This approach provides clear and interpretable cell type assignments, and the corresponding correlation values give a direct measure of annotation confidence. The strong agreement between broad annotations and more refined subtype classifications demonstrates the robustness of the method. Re embedding the annotated neurons shows that peripheral neuron populations form distinct groups, which confirms that the quality control and annotation steps preserve the underlying biological structure of the dataset.
+
+Focusing on sympathetic and sensory neuron populations allows a targeted view of the cell types that are most relevant for organ innervation analyses in Trace n Seq. The integration of disease state information from healthy, pancreatitis and cancer samples adds an important layer of biological interpretation. This provides the foundation for understanding how neuronal identity, transcriptional states and population composition vary across conditions that involve inflammation or tumor related remodeling.
+
+Overall, this workflow creates a reliable framework for neuronal analysis in Trace n Seq studies. It is modular, reproducible and compatible with both reference based and data driven approaches. The resulting annotated neuronal map can be extended to differential expression, trajectory analysis or spatial integration, and therefore offers a solid basis for future investigations of peripheral neural responses in health, injury and cancer.
+
+
+
