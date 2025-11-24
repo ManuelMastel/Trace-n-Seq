@@ -49,8 +49,12 @@ Creates a SingleCellExperiment object.
 Adds metadata and performs basic QC (e.g., percent mitochondrial).
 Outputs:
 counts_matrix.rds
-sce.rds with gene counts + cell metadata
 Purpose:
 Generate the count matrix required for downstream Seurat/SCE analysis.
+
+Part 2: 
+This covers the full downstream processing, QC, and biological interpretation of the SMART-seq2 dataset after alignment. The R Markdown workflow loads the STAR-generated count matrix, performs quality control, normalization, and detection of highly variable genes, and constructs a Seurat or SingleCellExperiment object. It then applies dimensionality reduction (PCA/UMAP), clustering, and annotation of neuronal subtypes using SingleR and curated gene signatures. Additional analyses include differential expression, detection of marker genes, and scoring of functional neuronal programs relevant to Trace-n-Seq. The final output is a fully annotated, biologically interpretable single-cell atlas of tissue-innervating neurons, presented both as an R Markdown notebook and an HTML report.
+sce.rds with gene counts + cell metadata
+
 
 
